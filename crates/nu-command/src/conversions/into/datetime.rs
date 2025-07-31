@@ -35,7 +35,7 @@ impl CmdArgument for Arguments {
 
 // In case it may be confused with chrono::TimeZone
 #[derive(Clone, Debug)]
-enum Zone {
+pub(crate) enum Zone {
     Utc,
     Local,
     East(u8),
@@ -282,7 +282,7 @@ impl Command for IntoDatetime {
 }
 
 #[derive(Clone, Debug)]
-struct DatetimeFormat(String);
+pub(crate) struct DatetimeFormat(String);
 
 fn action(input: &Value, args: &Arguments, head: Span) -> Value {
     let timezone = &args.zone_options;
@@ -409,80 +409,18 @@ fn action(input: &Value, args: &Arguments, head: Span) -> Value {
     // If input is not a timestamp, try parsing it as a string
     let span = input.span();
 
-    let parse_as_string = |val: &str| {
-        match dateformat {
-            Some(dt_format) => match DateTime::parse_from_str(val, &dt_format.item.0) {
-                Ok(dt) => {
-                    match timezone {
-                        None => {
-                            Value::date ( dt, head )
-                        },
-                        Some(Spanned { item, span }) => match item {
-                            Zone::Utc => {
-                                Value::date ( dt, head )
-                            }
-                            Zone::Local => {
-                                Value::date(dt.with_timezone(&Local).into(), *span)
-                            }
-                            Zone::East(i) => match FixedOffset::east_opt((*i as i32) * HOUR) {
-                                Some(eastoffset) => {
-                                    Value::date(dt.with_timezone(&eastoffset), *span)
-                                }
-                                None => Value::error(
-                                    ShellError::DatetimeParseError {
-                                        msg: input.to_abbreviated_string(&nu_protocol::Config::default()),
-                                        span: *span,
-                                    },
-                                    *span,
-                                ),
-                            },
-                            Zone::West(i) => match FixedOffset::west_opt((*i as i32) * HOUR) {
-                                Some(westoffset) => {
-                                    Value::date(dt.with_timezone(&westoffset), *span)
-                                }
-                                None => Value::error(
-                                    ShellError::DatetimeParseError {
-                                        msg: input.to_abbreviated_string(&nu_protocol::Config::default()),
-                                        span: *span,
-                                    },
-                                    *span,
-                                ),
-                            },
-                            Zone::Error => Value::error(
-                                // This is an argument error, not an input error
-                                ShellError::TypeMismatch {
-                                    err_message: "Invalid timezone or offset".to_string(),
-                                    span: *span,
-                                },
-                                *span,
-                            ),
-                        },
-                    }
-                },
-                Err(reason) => {
-                    parse_with_format(val, &dt_format.item.0, head).unwrap_or_else(|_| Value::error (
-                                ShellError::CantConvert { to_type: format!("could not parse as datetime using format '{}'", dt_format.item.0), from_type: reason.to_string(), span: head, help: Some("you can use `into datetime` without a format string to enable flexible parsing".to_string()) },
-                                head,
-                            ))
-                }
-            },
-
-            // Tries to automatically parse the date
-            // (i.e. without a format string)
-            // and assumes the system's local timezone if none is specified
-            None => match parse_date_from_string(val, span) {
-                Ok(date) => Value::date (
-                    date,
-                    span,
-                ),
-                Err(err) => err,
-            },
-        }
-    };
-
     match input {
-        Value::String { val, .. } => parse_as_string(val),
-        Value::Int { val, .. } => parse_as_string(&val.to_string()),
+        Value::String { val, .. } => {
+            parse_as_string(val, &head, timezone, &span, dateformat, input)
+        }
+        Value::Int { val, .. } => parse_as_string(
+            &val.to_string(),
+            &head,
+            &timezone,
+            &span,
+            &dateformat,
+            input,
+        ),
 
         // Propagate errors by explicitly matching them before the final case.
         Value::Error { .. } => input.clone(),
@@ -495,6 +433,84 @@ fn action(input: &Value, args: &Arguments, head: Span) -> Value {
             },
             head,
         ),
+    }
+}
+
+pub(crate) fn parse_as_string(
+    val: &str,
+    head: &Span,
+    timezone: &Option<Spanned<Zone>>,
+    span: &Span,
+    dateformat: &Option<Spanned<DatetimeFormat>>,
+    input: &Value,
+) -> Value {
+    match dateformat {
+        Some(dt_format) => match DateTime::parse_from_str(val, &dt_format.item.0) {
+            Ok(dt) => {
+                match timezone {
+                    None => {
+                        Value::date ( dt, *head )
+                    },
+                    Some(Spanned { item, span }) => match item {
+                        Zone::Utc => {
+                            Value::date ( dt, *head )
+                        }
+                        Zone::Local => {
+                            Value::date(dt.with_timezone(&Local).into(), *span)
+                        }
+                        Zone::East(i) => match FixedOffset::east_opt((*i as i32) * HOUR) {
+                            Some(eastoffset) => {
+                                Value::date(dt.with_timezone(&eastoffset), *span)
+                            }
+                            None => Value::error(
+                                ShellError::DatetimeParseError {
+                                    msg: input.to_abbreviated_string(&nu_protocol::Config::default()),
+                                    span: *span,
+                                },
+                                *span,
+                            ),
+                        },
+                        Zone::West(i) => match FixedOffset::west_opt((*i as i32) * HOUR) {
+                            Some(westoffset) => {
+                                Value::date(dt.with_timezone(&westoffset), *span)
+                            }
+                            None => Value::error(
+                                ShellError::DatetimeParseError {
+                                    msg: input.to_abbreviated_string(&nu_protocol::Config::default()),
+                                    span: *span,
+                                },
+                                *span,
+                            ),
+                        },
+                        Zone::Error => Value::error(
+                            // This is an argument error, not an input error
+                            ShellError::TypeMismatch {
+                                err_message: "Invalid timezone or offset".to_string(),
+                                span: *span,
+                            },
+                            *span,
+                        ),
+                    },
+                }
+            },
+            Err(reason) => {
+                parse_with_format(val, &dt_format.item.0, *head).unwrap_or_else(|_| Value::error (
+                            ShellError::CantConvert { to_type: format!("could not parse as datetime using format '{}'", dt_format.item.0), from_type: reason.to_string(), span: *head, help: Some("you can use `into datetime` without a format string to enable flexible parsing".to_string()) },
+                            *head,
+                        ))
+            }
+        },
+
+        // Tries to automatically parse the date
+        // (i.e. without a format string)
+        // and assumes the system's local timezone if none is specified
+        None => match parse_date_from_string(val, *span) {
+            Ok(date) => Value::date (
+                date,
+                *span,
+            ),
+            Err(err) => err,
+        },
     }
 }
 

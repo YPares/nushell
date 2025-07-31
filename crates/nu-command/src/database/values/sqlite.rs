@@ -573,6 +573,7 @@ fn read_single_table(
 /// The SQLite type behind a query column returned as some raw type (e.g. 'text')
 #[derive(Clone, Copy)]
 pub enum DeclType {
+    DATETIME,
     Json,
     Jsonb,
 }
@@ -580,9 +581,10 @@ pub enum DeclType {
 impl DeclType {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
+            "DATETIME" => Some(DeclType::DATETIME),
             "JSON" => Some(DeclType::Json),
             "JSONB" => Some(DeclType::Jsonb),
-            _ => None, // We are only special-casing JSON(B) columns for now
+            _ => None,
         }
     }
 }
@@ -712,6 +714,7 @@ pub fn convert_sqlite_value_to_nu_value(
         ValueRef::Integer(i) => Value::int(i, span),
         ValueRef::Real(f) => Value::float(f, span),
         ValueRef::Text(buf) => match (std::str::from_utf8(buf), decl_type) {
+            // (Ok(txt), Some(DeclType::DATETIME)) => {}
             (Ok(txt), Some(DeclType::Json | DeclType::Jsonb)) => {
                 match crate::convert_json_string_to_value(txt, span) {
                     Ok(val) => val,
