@@ -22,7 +22,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError, RwLock,
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::Sender,
         mpsc::channel,
@@ -1454,5 +1454,350 @@ mod test_cwd {
 
         let cwd = engine_state.cwd(Some(&stack)).unwrap();
         assert_path_eq!(cwd, foo);
+    }
+}
+
+/// Thread-safe wrapper around EngineState for sharing across multiple REPL instances
+/// 
+/// This wrapper allows multiple shells to share the same EngineState while maintaining
+/// thread safety through RwLock. Read-heavy operations (command lookup, execution) can
+/// proceed concurrently, while write operations (defining new commands, updating config)
+/// are serialized.
+/// 
+/// # Example
+/// ```rust,ignore
+/// let engine = ThreadSafeEngineState::new(EngineState::new());
+/// 
+/// // Spawn shell 1
+/// let engine1 = engine.clone();
+/// let handle1 = std::thread::spawn(move || {
+///     let stack = Stack::new();
+///     // run repl with engine1...
+/// });
+/// 
+/// // Spawn shell 2
+/// let engine2 = engine.clone();
+/// let handle2 = std::thread::spawn(move || {
+///     let stack = Stack::new();
+///     // run repl with engine2...
+/// });
+/// ```
+#[derive(Clone)]
+pub struct ThreadSafeEngineState {
+    inner: Arc<RwLock<EngineState>>,
+}
+
+impl ThreadSafeEngineState {
+    /// Create a new thread-safe wrapper around an existing EngineState
+    pub fn new(engine_state: EngineState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(engine_state)),
+        }
+    }
+
+    /// Create from an existing Arc<RwLock<EngineState>>
+    pub fn from_arc(arc: Arc<RwLock<EngineState>>) -> Self {
+        Self { inner: arc }
+    }
+
+    /// Get a clone of the inner Arc for advanced use cases
+    pub fn inner_arc(&self) -> Arc<RwLock<EngineState>> {
+        self.inner.clone()
+    }
+
+    // ==================== WRITE-LOCKED METHODS ====================
+    // These methods mutate EngineState and require exclusive access
+
+    /// Merge a StateDelta into the engine state
+    /// 
+    /// This is the primary way new commands, modules, and variables are added
+    pub fn merge_delta(&self, delta: StateDelta) -> Result<(), ShellError> {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.merge_delta(delta)
+    }
+
+    /// Merge environment variables from a Stack into the engine state
+    pub fn merge_env(&self, stack: &mut Stack) -> Result<(), ShellError> {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.merge_env(stack)
+    }
+
+    /// Reset signals in the engine state
+    pub fn reset_signals(&self) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.reset_signals()
+    }
+
+    /// Set signals in the engine state
+    pub fn set_signals(&self, signals: Signals) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.set_signals(signals)
+    }
+
+    /// Clean up unused variables from a Stack to prevent memory leaks
+    pub fn cleanup_stack_variables(&self, stack: &mut Stack) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.cleanup_stack_variables(stack)
+    }
+
+    /// Add an environment variable to the engine state
+    pub fn add_env_var(&self, name: String, val: Value) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.add_env_var(name, val)
+    }
+
+    /// Set the configuration
+    pub fn set_config(&self, conf: impl Into<Arc<Config>>) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.set_config(conf)
+    }
+
+    /// Regenerate the $nu constant with current state
+    pub fn generate_nu_constant(&self) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.generate_nu_constant()
+    }
+
+    /// Add a file to the engine state
+    pub fn add_file(&self, filename: Arc<str>, content: Arc<[u8]>) -> FileId {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.add_file(filename, content)
+    }
+
+    /// Add a span to the engine state
+    pub fn add_span(&self, span: Span) -> SpanId {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.add_span(span)
+    }
+
+    /// Set a config path
+    pub fn set_config_path(&self, key: &str, val: PathBuf) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.set_config_path(key, val)
+    }
+
+    /// Set the startup time
+    pub fn set_startup_time(&self, startup_time: i64) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.set_startup_time(startup_time)
+    }
+
+    /// Recover from a panic
+    pub fn recover_from_panic(&self) {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        guard.recover_from_panic()
+    }
+
+    // ==================== READ-LOCKED METHODS ====================
+    // These methods only read from EngineState and can proceed concurrently
+
+    /// Get signals (read-only access)
+    pub fn signals(&self) -> Signals {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.signals().clone()
+    }
+
+    /// Find a declaration by name
+    pub fn find_decl(&self, name: &[u8], removed_overlays: &[Vec<u8>]) -> Option<DeclId> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.find_decl(name, removed_overlays)
+    }
+
+    /// Find the name of a declaration
+    pub fn find_decl_name(&self, decl_id: DeclId, removed_overlays: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.find_decl_name(decl_id, removed_overlays).map(|s| s.to_vec())
+    }
+
+    /// Find an overlay by name
+    pub fn find_overlay(&self, name: &[u8]) -> Option<OverlayId> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.find_overlay(name)
+    }
+
+    /// Find an active overlay by name
+    pub fn find_active_overlay(&self, name: &[u8]) -> Option<OverlayId> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.find_active_overlay(name)
+    }
+
+    /// Find a module by name
+    pub fn find_module(&self, name: &[u8], removed_overlays: &[Vec<u8>]) -> Option<ModuleId> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.find_module(name, removed_overlays)
+    }
+
+    /// Get a command by its ID
+    pub fn get_decl(&self, decl_id: DeclId) -> Arc<dyn Command> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        let cmd = guard
+            .decls
+            .get(decl_id.get())
+            .expect("internal error: missing declaration");
+        Arc::from(cmd.clone())
+    }
+
+    /// Get a block by its ID
+    pub fn get_block(&self, block_id: BlockId) -> Arc<Block> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_block(block_id).clone()
+    }
+
+    /// Try to get a block by its ID
+    pub fn try_get_block(&self, block_id: BlockId) -> Option<Arc<Block>> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.try_get_block(block_id).cloned()
+    }
+
+    /// Get a module by its ID
+    pub fn get_module(&self, module_id: ModuleId) -> Arc<Module> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        Arc::clone(
+            guard
+                .modules
+                .get(module_id.get())
+                .expect("internal error: missing module"),
+        )
+    }
+
+    /// Get the current configuration
+    pub fn get_config(&self) -> Arc<Config> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_config().clone()
+    }
+
+    /// Get current working directory
+    pub fn cwd(&self, stack: Option<&Stack>) -> Result<AbsolutePathBuf, ShellError> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.cwd(stack)
+    }
+
+    /// Get current working directory as string
+    pub fn cwd_as_string(&self, stack: Option<&Stack>) -> Result<String, ShellError> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.cwd_as_string(stack)
+    }
+
+    /// Get environment variable
+    pub fn get_env_var(&self, name: &str) -> Option<Value> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_env_var(name).cloned()
+    }
+
+    /// Get environment variable (case insensitive)
+    pub fn get_env_var_insensitive(&self, name: &str) -> Option<(String, Value)> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_env_var_insensitive(name)
+            .map(|(k, v)| (k.clone(), v.clone()))
+    }
+
+    /// Get the number of declarations
+    pub fn num_decls(&self) -> usize {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.num_decls()
+    }
+
+    /// Get the number of variables
+    pub fn num_vars(&self) -> usize {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.num_vars()
+    }
+
+    /// Get the number of blocks
+    pub fn num_blocks(&self) -> usize {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.num_blocks()
+    }
+
+    /// Get the number of modules
+    pub fn num_modules(&self) -> usize {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.num_modules()
+    }
+
+    /// Check if the current execution is a background job
+    pub fn is_background_job(&self) -> bool {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.is_background_job()
+    }
+
+    /// Get a span by ID
+    pub fn get_span(&self, span_id: SpanId) -> Span {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        (&*guard).get_span(span_id)
+    }
+
+    /// Get span contents
+    pub fn get_span_contents(&self, span: Span) -> Vec<u8> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_span_contents(span).to_vec()
+    }
+
+    /// Get a variable by its ID
+    pub fn get_var(&self, var_id: VarId) -> Variable {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_var(var_id).clone()
+    }
+
+    /// Get a constant by its ID
+    pub fn get_constant(&self, var_id: VarId) -> Option<Value> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_constant(var_id).cloned()
+    }
+
+    /// Get history configuration
+    pub fn history_config(&self) -> Option<HistoryConfig> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.history_config()
+    }
+
+    /// Get the startup time
+    pub fn get_startup_time(&self) -> i64 {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_startup_time()
+    }
+
+    /// Get config path
+    pub fn get_config_path(&self, key: &str) -> Option<PathBuf> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_config_path(key).cloned()
+    }
+
+    /// Get file contents
+    pub fn get_file_contents(&self) -> Vec<CachedFile> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.get_file_contents().to_vec()
+    }
+
+    /// Get active overlay names
+    pub fn active_overlay_names(&self, removed_overlays: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.active_overlay_names(removed_overlays).map(|s| s.to_vec()).collect()
+    }
+
+    /// Check if debugging is active
+    pub fn is_debugging(&self) -> bool {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.is_debugging()
+    }
+
+    // ==================== ADVANCED METHODS ====================
+
+    /// Execute a closure with read access to EngineState
+    pub fn with_read<T>(&self, f: impl FnOnce(&EngineState) -> T) -> T {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        f(&guard)
+    }
+
+    /// Execute a closure with write access to EngineState
+    pub fn with_write<T>(&self, f: impl FnOnce(&mut EngineState) -> T) -> T {
+        let mut guard = self.inner.write().expect("EngineState write lock poisoned");
+        f(&mut guard)
+    }
+
+    /// Clone the underlying EngineState (expensive - use sparingly)
+    pub fn clone_engine_state(&self) -> EngineState {
+        let guard = self.inner.read().expect("EngineState read lock poisoned");
+        guard.clone()
     }
 }
