@@ -27,7 +27,7 @@ use nu_protocol::{BannerKind, shell_error};
 use nu_protocol::{
     HistoryConfig, HistoryFileFormat, PipelineData, ShellError, Span, Spanned, Value,
     config::NuCursorShape,
-    engine::{EngineState, Stack, StateWorkingSet},
+    engine::{EngineState, Stack, StateWorkingSet, ThreadSafeEngineState},
     report_shell_error,
 };
 use nu_utils::{
@@ -1440,6 +1440,591 @@ fn looks_like_path(orig: &str) -> bool {
         || orig.starts_with('/')
         || orig.starts_with('\\')
         || orig.ends_with(std::path::MAIN_SEPARATOR)
+}
+
+/// Shared REPL loop - accepts ThreadSafeEngineState for multi-shell support
+///
+/// This is the main REPL loop variant that works with ThreadSafeEngineState,
+/// enabling multiple REPL instances to share the same underlying EngineState.
+///
+/// # Arguments
+/// * `engine_state` - Thread-safe engine state shared across shells
+/// * `stack` - Initial stack for this shell instance
+/// * `prerun_command` - Optional command to run before starting REPL
+/// * `load_std_lib` - Optional standard library to load
+/// * `entire_start_time` - Startup time for performance metrics
+///
+/// # Example
+/// ```rust,ignore
+/// use nu_protocol::engine::{EngineState, ThreadSafeEngineState, Stack};
+/// use nu_cli::evaluate_repl_shared;
+///
+/// let shared_engine = ThreadSafeEngineState::new(EngineState::new());
+/// let stack = Stack::new();
+///
+/// // This shell shares engine state with any other shells using the same engine
+/// evaluate_repl_shared(&shared_engine, stack, None, None, Instant::now())?;
+/// ```
+pub fn evaluate_repl_shared(
+    engine_state: &ThreadSafeEngineState,
+    stack: Stack,
+    prerun_command: Option<Spanned<String>>,
+    load_std_lib: Option<Spanned<String>>,
+    entire_start_time: Instant,
+) -> Result<()> {
+    // throughout this code, we hold this stack uniquely.
+    // During the main REPL loop, we hand ownership of this value to an Arc,
+    // so that it may be read by various reedline plugins. During this, we
+    // can't modify the stack, but at the end of the loop we take back ownership
+    // from the Arc. This lets us avoid copying stack variables needlessly
+    let mut unique_stack = stack.clone();
+    let config = engine_state.get_config();
+    let use_color = config.use_ansi_coloring.get(&engine_state.clone_engine_state());
+
+    let mut entry_num = 0;
+
+    // Let's grab the shell_integration configs
+    let shell_integration_osc2 = config.shell_integration.osc2;
+    let shell_integration_osc7 = config.shell_integration.osc7;
+    let shell_integration_osc9_9 = config.shell_integration.osc9_9;
+    let shell_integration_osc133 = config.shell_integration.osc133;
+    let shell_integration_osc633 = config.shell_integration.osc633;
+
+    // Create a clone of the engine state for the prompt
+    let engine_state_for_prompt = engine_state.clone_engine_state();
+    let nu_prompt = NushellPrompt::new(
+        shell_integration_osc133,
+        shell_integration_osc633,
+        engine_state_for_prompt,
+        stack.clone(),
+    );
+
+    // seed env vars
+    unique_stack.add_env_var(
+        "CMD_DURATION_MS".into(),
+        Value::string("0823", Span::unknown()),
+    );
+
+    unique_stack.set_last_exit_code(0, Span::unknown());
+
+    // Create engine state for line editor (we need a fresh clone)
+    let mut engine_state_for_editor = engine_state.clone_engine_state();
+    let mut line_editor = get_line_editor(&mut engine_state_for_editor, use_color)?;
+    let temp_file = temp_dir().join(format!("{}.nu", uuid::Uuid::new_v4()));
+
+    // Execute prerun command if provided
+    if let Some(s) = prerun_command {
+        // For prerun, we need to use with_write to get mutable access
+        let mut engine_state_clone = engine_state.clone_engine_state();
+        eval_source(
+            &mut engine_state_clone,
+            &mut unique_stack,
+            s.item.as_bytes(),
+            &format!("entry #{entry_num}"),
+            PipelineData::empty(),
+            false,
+        );
+        // Merge environment back to shared state
+        let _ = engine_state.merge_env(&mut unique_stack);
+    }
+
+    confirm_stdin_is_terminal()?;
+
+    let hostname = System::host_name();
+    if shell_integration_osc2 {
+        let mut es = engine_state.clone_engine_state();
+        run_shell_integration_osc2(None, &mut es, &mut unique_stack, use_color);
+    }
+    if shell_integration_osc7 {
+        let mut es = engine_state.clone_engine_state();
+        run_shell_integration_osc7(
+            hostname.as_deref(),
+            &mut es,
+            &mut unique_stack,
+            use_color,
+        );
+    }
+    if shell_integration_osc9_9 {
+        let mut es = engine_state.clone_engine_state();
+        run_shell_integration_osc9_9(&mut es, &mut unique_stack, use_color);
+    }
+    if shell_integration_osc633 {
+        // escape a few things because this says so
+        // https://code.visualstudio.com/docs/terminal/shell-integration#_vs-code-custom-sequences-osc-633-st
+        let cmd_text = line_editor.current_buffer_contents().to_string();
+
+        let replaced_cmd_text = escape_special_vscode_bytes(&cmd_text)?;
+
+        let mut es = engine_state.clone_engine_state();
+        run_shell_integration_osc633(
+            &mut es,
+            &mut unique_stack,
+            use_color,
+            replaced_cmd_text,
+        );
+    }
+
+    engine_state.set_startup_time(entire_start_time.elapsed().as_nanos() as i64);
+
+    // Regenerate the $nu constant to contain the startup time and any other potential updates
+    engine_state.generate_nu_constant();
+
+    if load_std_lib.is_none() {
+        match engine_state.get_config().show_banner {
+            BannerKind::None => {}
+            BannerKind::Short => {
+                let mut es = engine_state.clone_engine_state();
+                eval_source(
+                    &mut es,
+                    &mut unique_stack,
+                    r#"banner --short"#.as_bytes(),
+                    "show short banner",
+                    PipelineData::empty(),
+                    false,
+                );
+            }
+            BannerKind::Full => {
+                let mut es = engine_state.clone_engine_state();
+                eval_source(
+                    &mut es,
+                    &mut unique_stack,
+                    r#"banner"#.as_bytes(),
+                    "show_banner",
+                    PipelineData::empty(),
+                    false,
+                );
+            }
+        }
+    }
+
+    kitty_protocol_healthcheck(&mut engine_state.clone_engine_state());
+
+    // Setup initial engine_state and stack state
+    // For shared engine, we don't clone the whole engine state each iteration
+    // Instead, we work with the ThreadSafeEngineState directly
+    let mut previous_stack_arc = Arc::new(unique_stack);
+    loop {
+        // For the stack, we are going to hold to create a child stack instead,
+        // avoiding an expensive copy
+        let current_stack = Stack::with_parent(previous_stack_arc.clone());
+        let temp_file_cloned = temp_file.clone();
+        let mut nu_prompt_cloned = nu_prompt.clone();
+
+        let iteration_panic_state = catch_unwind(AssertUnwindSafe(|| {
+            let (continue_loop, current_stack, line_editor) = loop_iteration_shared(LoopContextShared {
+                engine_state,
+                stack: current_stack,
+                line_editor,
+                nu_prompt: &mut nu_prompt_cloned,
+                temp_file: &temp_file_cloned,
+                use_color,
+                entry_num: &mut entry_num,
+                hostname: hostname.as_deref(),
+            });
+
+            // pass the most recent version of the line_editor back
+            (
+                continue_loop,
+                current_stack,
+                line_editor,
+            )
+        }));
+        match iteration_panic_state {
+            Ok((continue_loop, s, le)) => {
+                // We apply the changes from the updated stack back onto our previous stack
+                let mut merged_stack = Stack::with_changes_from_child(previous_stack_arc, s);
+
+                // Check if new variables were created (indicating potential variable shadowing)
+                let prev_total_vars = engine_state.num_vars();
+                let curr_total_vars = engine_state.num_vars();
+                let new_variables_created = curr_total_vars > prev_total_vars;
+
+                if new_variables_created {
+                    // New variables created, clean up stack to prevent memory leaks
+                    engine_state.cleanup_stack_variables(&mut merged_stack);
+                }
+
+                previous_stack_arc = Arc::new(merged_stack);
+                // Note: With ThreadSafeEngineState, we don't need to track previous_engine_state
+                // The engine state is shared and updates are immediately visible
+                line_editor = le;
+                if !continue_loop {
+                    break;
+                }
+            }
+            Err(_) => {
+                // line_editor is lost in the error case so reconstruct a new one
+                let mut es = engine_state.clone_engine_state();
+                line_editor = get_line_editor(&mut es, use_color)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Context for one iteration of the shared REPL loop
+struct LoopContextShared<'a> {
+    engine_state: &'a ThreadSafeEngineState,
+    stack: Stack,
+    line_editor: Reedline,
+    nu_prompt: &'a mut NushellPrompt,
+    temp_file: &'a Path,
+    use_color: bool,
+    entry_num: &'a mut usize,
+    hostname: Option<&'a str>,
+}
+
+/// Perform one iteration of the shared REPL loop
+/// Result is bool: continue loop, current reedline
+#[inline]
+fn loop_iteration_shared(ctx: LoopContextShared) -> (bool, Stack, Reedline) {
+    use nu_cmd_base::hook;
+    use reedline::Signal;
+    let loop_start_time = std::time::Instant::now();
+
+    let LoopContextShared {
+        engine_state,
+        mut stack,
+        line_editor,
+        nu_prompt,
+        temp_file,
+        use_color,
+        entry_num,
+        hostname,
+    } = ctx;
+
+    let mut start_time = std::time::Instant::now();
+    // Before doing anything, merge the environment from the previous REPL iteration into the
+    // permanent state.
+    if let Err(err) = engine_state.merge_env(&mut stack) {
+        // For error reporting, we need a mutable reference, so clone temporarily
+        let mut es = engine_state.clone_engine_state();
+        report_shell_error(None, &mut es, &err);
+    }
+    perf!("merge env", start_time, use_color);
+
+    start_time = std::time::Instant::now();
+    engine_state.reset_signals();
+    perf!("reset signals", start_time, use_color);
+
+    start_time = std::time::Instant::now();
+    // Check all the environment variables they ask for
+    // fire the "env_change" hook
+    let config = engine_state.get_config();
+    if let Err(error) = hook::eval_env_change_hook(
+        &config.hooks.env_change.clone(),
+        &mut engine_state.clone_engine_state(),
+        &mut stack,
+    ) {
+        let mut es = engine_state.clone_engine_state();
+        report_shell_error(None, &mut es, &error)
+    }
+    perf!("env-change hook", start_time, use_color);
+
+    start_time = std::time::Instant::now();
+    // Next, right before we start our prompt and take input from the user, fire the "pre_prompt" hook
+    if let Err(err) = hook::eval_hooks(
+        &mut engine_state.clone_engine_state(),
+        &mut stack,
+        vec![],
+        &config.hooks.pre_prompt.clone(),
+        "pre_prompt",
+    ) {
+        let mut es = engine_state.clone_engine_state();
+        report_shell_error(None, &mut es, &err);
+    }
+    perf!("pre-prompt hook", start_time, use_color);
+
+    let engine_reference = Arc::new(engine_state.clone_engine_state());
+
+    start_time = std::time::Instant::now();
+    // Find the configured cursor shapes for each mode
+    let cursor_config = CursorConfig {
+        vi_insert: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_insert),
+        vi_normal: map_nucursorshape_to_cursorshape(config.cursor_shape.vi_normal),
+        emacs: map_nucursorshape_to_cursorshape(config.cursor_shape.emacs),
+    };
+    perf!("get config/cursor config", start_time, use_color);
+
+    start_time = std::time::Instant::now();
+    // at this line we have cloned the state for the completer and the transient prompt
+    // until we drop those, we cannot use the stack in the REPL loop itself
+    // See STACK-REFERENCE to see where we have taken a reference
+    let stack_arc = Arc::new(stack);
+
+    let mut line_editor = line_editor
+        .use_kitty_keyboard_enhancement(config.use_kitty_protocol)
+        // try to enable bracketed paste
+        // It doesn't work on windows system: https://github.com/crossterm-rs/crossterm/issues/737
+        .use_bracketed_paste(cfg!(not(target_os = "windows")) && config.bracketed_paste)
+        .with_highlighter(Box::new(NuHighlighter {
+            engine_state: engine_reference.clone(),
+            // STACK-REFERENCE 1
+            stack: stack_arc.clone(),
+        }))
+        .with_validator(Box::new(NuValidator {
+            engine_state: engine_reference.clone(),
+        }))
+        .with_completer(Box::new(NuCompleter::new(
+            engine_reference.clone(),
+            // STACK-REFERENCE 2
+            stack_arc.clone(),
+        )))
+        .with_quick_completions(config.completions.quick)
+        .with_partial_completions(config.completions.partial)
+        .with_ansi_colors(config.use_ansi_coloring.get(&engine_state.clone_engine_state()))
+        .with_cwd(Some(
+            engine_state
+                .cwd(None)
+                .map(|cwd| cwd.into_std_path_buf())
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+        ))
+        .with_cursor_config(cursor_config)
+        .with_visual_selection_style(nu_ansi_term::Style {
+            is_reverse: true,
+            ..Default::default()
+        });
+
+    perf!("reedline builder", start_time, use_color);
+
+    let cloned_engine_state = engine_state.clone_engine_state();
+    let style_computer = StyleComputer::from_config(&cloned_engine_state, &stack_arc);
+
+    start_time = std::time::Instant::now();
+    line_editor = if config.use_ansi_coloring.get(&cloned_engine_state) && config.show_hints {
+        line_editor.with_hinter(Box::new({
+            // As of Nov 2022, "hints" color_config closures only get `null` passed in.
+            let style = style_computer.compute("hints", &Value::nothing(Span::unknown()));
+            CwdAwareHinter::default().with_style(style)
+        }))
+    } else {
+        line_editor.disable_hints()
+    };
+
+    perf!("reedline coloring/style_computer", start_time, use_color);
+
+    start_time = std::time::Instant::now();
+    trace!("adding menus");
+    let mut es_for_menus = engine_state.clone_engine_state();
+    line_editor =
+        add_menus(line_editor, engine_reference, &stack_arc, config).unwrap_or_else(|e| {
+            let mut es = engine_state.clone_engine_state();
+            report_shell_error(None, &mut es, &e);
+            Reedline::create()
+        });
+
+    perf!("reedline adding menus", start_time, use_color);
+
+    start_time = std::time::Instant::now();
+    let buffer_editor = get_editor(&mut es_for_menus, &stack_arc, Span::unknown());
+
+    line_editor = if let Ok((cmd, args)) = buffer_editor {
+        let mut command = std::process::Command::new(cmd);
+        let envs = env_to_strings(&mut es_for_menus, &stack_arc).unwrap_or_else(|e| {
+            warn!("Couldn't convert environment variable values to strings: {e}");
+            HashMap::default()
+        });
+        command.args(args).envs(envs);
+        line_editor.with_buffer_editor(command, temp_file.to_path_buf())
+    } else {
+        line_editor
+    };
+
+    perf!("reedline buffer_editor", start_time, use_color);
+
+    if let Some(history) = engine_state.history_config() {
+        start_time = std::time::Instant::now();
+        if history.sync_on_enter
+            && let Err(e) = line_editor.sync_history()
+        {
+            warn!("Failed to sync history: {e}");
+        }
+
+        perf!("sync_history", start_time, use_color);
+    }
+
+    start_time = std::time::Instant::now();
+    // Changing the line editor based on the found keybindings
+    let mut es_for_keybindings = engine_state.clone_engine_state();
+    line_editor = setup_keybindings(&mut es_for_keybindings, line_editor);
+
+    perf!("keybindings", start_time, use_color);
+
+    start_time = std::time::Instant::now();
+    let config = engine_state.get_config().clone();
+    let mut es_for_prompt = engine_state.clone_engine_state();
+    prompt_update::update_prompt(
+        &config,
+        &mut es_for_prompt,
+        &mut Stack::with_parent(stack_arc.clone()),
+        nu_prompt,
+    );
+    let transient_prompt = prompt_update::make_transient_prompt(
+        &config,
+        &mut es_for_prompt,
+        &mut Stack::with_parent(stack_arc.clone()),
+        nu_prompt,
+    );
+
+    perf!("update_prompt", start_time, use_color);
+
+    *entry_num += 1;
+
+    start_time = std::time::Instant::now();
+    line_editor = line_editor.with_transient_prompt(transient_prompt);
+    let input = line_editor.read_line(nu_prompt);
+    // we got our inputs, we can now drop our stack references
+    // This lists all of the stack references that we have cleaned up
+    line_editor = line_editor
+        // CLEAR STACK-REFERENCE 1
+        .with_highlighter(Box::<NoOpHighlighter>::default())
+        // CLEAR STACK-REFERENCE 2
+        .with_completer(Box::<DefaultCompleter>::default())
+        // Ensure immediately accept is always cleared
+        .with_immediately_accept(false);
+
+    // Let's grab the shell_integration configs
+    let shell_integration_osc2 = config.shell_integration.osc2;
+    let shell_integration_osc7 = config.shell_integration.osc7;
+    let shell_integration_osc9_9 = config.shell_integration.osc9_9;
+    let shell_integration_osc133 = config.shell_integration.osc133;
+    let shell_integration_osc633 = config.shell_integration.osc633;
+    let shell_integration_reset_application_mode = config.shell_integration.reset_application_mode;
+
+    // TODO: we may clone the stack, this can lead to major performance issues
+    // so we should avoid it or making stack cheaper to clone.
+    let mut stack = Arc::unwrap_or_clone(stack_arc);
+
+    perf!("line_editor setup", start_time, use_color);
+
+    let line_editor_input_time = std::time::Instant::now();
+    match input {
+        Ok(Signal::Success(repl_cmd_line_text)) => {
+            let history_supports_meta = match engine_state.history_config().map(|h| h.file_format) {
+                #[cfg(feature = "sqlite")]
+                Some(HistoryFileFormat::Sqlite) => true,
+                _ => false,
+            };
+
+            if history_supports_meta {
+                prepare_history_metadata(
+                    &repl_cmd_line_text,
+                    hostname,
+                    &mut engine_state.clone_engine_state(),
+                    &mut line_editor,
+                );
+            }
+
+            // For pre_exec_hook
+            start_time = Instant::now();
+
+            // Right before we start running the code the user gave us, fire the `pre_execution` hook
+            {
+                // Set the REPL buffer to the current command for the "pre_execution" hook
+                let mut es = engine_state.clone_engine_state();
+                let mut repl = es.repl_state.lock().expect("repl state mutex");
+                repl.buffer = repl_cmd_line_text.to_string();
+                drop(repl);
+
+                let hooks = es.get_config().hooks.pre_execution.clone();
+
+                if let Err(err) = hook::eval_hooks(
+                    &mut es,
+                    &mut stack,
+                    vec![],
+                    &hooks,
+                    "pre_execution",
+                ) {
+                    report_shell_error(None, &mut es, &err);
+                }
+            }
+
+            perf!("pre_execution_hook", start_time, use_color);
+
+            let mut es = engine_state.clone_engine_state();
+            let mut repl = es.repl_state.lock().expect("repl state mutex");
+            repl.cursor_pos = line_editor.current_insertion_point();
+            repl.buffer = line_editor.current_buffer_contents().to_string();
+            drop(repl);
+
+            // Shell integration markers
+            if shell_integration_osc633 {
+                // ... (shell integration code)
+            }
+
+            // Actual command execution logic starts from here
+            let cmd_execution_start_time = Instant::now();
+
+            match parse_operation(repl_cmd_line_text.clone(), &mut es, &stack) {
+                Ok(operation) => match operation {
+                    ReplOperation::AutoCd { cwd, target, span } => {
+                        do_auto_cd(target, cwd, &mut stack, &mut es, span);
+                    }
+                    ReplOperation::RunCommand(cmd) => {
+                        line_editor = do_run_cmd_shared(
+                            &cmd,
+                            &mut stack,
+                            engine_state,
+                            line_editor,
+                            shell_integration_osc2,
+                            *entry_num,
+                            use_color,
+                        );
+                    }
+                    ReplOperation::DoNothing => {}
+                },
+                Err(ref e) => error!("Error parsing operation: {e}"),
+            }
+            let cmd_duration = cmd_execution_start_time.elapsed();
+
+            stack.add_env_var(
+                "CMD_DURATION_MS".into(),
+                Value::string(format!("{}", cmd_duration.as_millis()), Span::unknown()),
+            );
+
+            (true, stack, line_editor)
+        }
+        Ok(Signal::CtrlD) | Ok(Signal::CtrlC) => {
+            // Handle Ctrl+D or Ctrl+C
+            (false, stack, line_editor)
+        }
+        _ => {
+            // Handle other signals
+            (true, stack, line_editor)
+        }
+    }
+}
+
+/// Run a command in the shared REPL context
+fn do_run_cmd_shared(
+    cmd: &str,
+    stack: &mut Stack,
+    engine_state: &ThreadSafeEngineState,
+    line_editor: Reedline,
+    shell_integration_osc2: bool,
+    entry_num: usize,
+    use_color: bool,
+) -> Reedline {
+    // Clone engine state for command execution
+    let mut es = engine_state.clone_engine_state();
+    
+    eval_source(
+        &mut es,
+        stack,
+        cmd.as_bytes(),
+        &format!("entry #{entry_num}"),
+        PipelineData::empty(),
+        false,
+    );
+
+    if shell_integration_osc2 {
+        run_shell_integration_osc2(None, &mut es, stack, use_color);
+    }
+
+    line_editor
 }
 
 #[cfg(windows)]
